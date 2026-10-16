@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Tilt Parallax</title>
+<style>
+  html, body { height: 100%; margin: 0; background: #151515; overflow: hidden; }
+  body { display: grid; place-items: center; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+
+  .stage {
+    --ar: 1;
+    position: relative;
+    width: min(100vw, calc(100dvh * var(--ar)));
+    aspect-ratio: var(--ar);
+    overflow: hidden;
+    touch-action: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .layer {
+    position: absolute;
+    left: 0; top: 0; width: 100%; height: 100%;
+    object-fit: fill;
+    will-change: transform;
+    pointer-events: none;
+    user-select: none;
+    -webkit-user-drag: none;
+  }
+
+  .ui {
+    position: absolute; left: 0; right: 0; bottom: max(16px, env(safe-area-inset-bottom));
+    display: flex; flex-direction: column; align-items: center; gap: 8px;
+    pointer-events: none;
+  }
+  button#enable {
+    pointer-events: auto;
+    font-weight: 600; font-size: 15px; line-height: 1; font-family: inherit;
+    padding: 12px 20px; border-radius: 999px; border: 0;
+    background: #f2f2f2; color: #151515; cursor: pointer;
+  }
+  button#enable:focus-visible { outline: 3px solid #7fb4ff; outline-offset: 3px; }
+  .hint {
+    font-size: 13px; color: #fff; background: rgba(0,0,0,.55);
+    padding: 6px 12px; border-radius: 999px;
+    transition: opacity .6s ease;
+  }
+  .hidden { display: none !important; }
+  .fade { opacity: 0; }
+</style>
+</head>
+<body>
+
+<main class="stage" id="stage" aria-label="Animated portrait that shifts as you tilt your phone or move your mouse. Tap for a sparkle flash.">
+  <div class="ui">
+    <button id="enable" class="hidden" type="button">Tap to enable tilt</button>
+    <div id="hint" class="hint hidden"></div>
+  </div>
+</main>
+
+<script>
+/* ======================= EDIT THESE ======================= */
+
+/*
+  LAYERS: list from BACK to FRONT (the order of lines = stacking order).
+
+  id          a short name the animation script uses
+  depth       0 = barely moves, 1+ = moves the most
+  controlled  true = the script sets this layer's opacity (fades, flashes, frame swaps)
+  rest        opacity of a controlled layer if motion is turned off (default 0)
+  rotate / idleRotate / breathe / origin   optional
+
+  Every layer that belongs to the portrait shares PORTRAIT settings so they all
+  move and breathe together and never drift apart. The two outlines use PORTRAIT
+  too, with a slightly different depth, so they float a little apart from her when you tilt.
+*/
+const PORTRAIT = { depth: 0.60, breathe: 0.006, origin: "50% 90%" };
+
+// Helpers that expand a numbered series (bird01, bird02, ...) into layer entries and ids
+const ids = (prefix, count) =>
+  Array.from({ length: count }, (_, i) => prefix + String(i + 1).padStart(2, "0"));
+
+function frames(idPrefix, srcPrefix, count, extra) {
+  return ids(idPrefix, count).map((id, i) => ({
+    id: id,
+    src: srcPrefix + String(i + 1).padStart(2, "0") + ".png",
+    controlled: true,
+    rest: (i === 0 && extra.rest1) ? extra.rest1 : 0,
+    depth: extra.depth
+  }));
+}
+
+const LAYERS = [
+  { id: "bg1", src: "layer1-bucketgrl-prt-background1.png", depth: 0.12 },
+  { id: "bg2", src: "layer1-bucketgrl-prt-background2.png", depth: 0.18, controlled: true, rest: 0.7 },   // sparkles and clouds
+
+  ...frames("bird",     "layer2-bucketgrl-prt-bird",     14, { depth: 0.28, rest1: 1 }),
+  ...frames("balloonA", "layer3-bucketgrl-prt-balloonA", 32, { depth: 0.32 }),
+  ...frames("balloonB", "layer3-bucketgrl-prt-balloonB", 60, { depth: 0.38 }),
+
+  { id: "outline1", src: "layer4-bucketgrl-prt-outline1.png", ...PORTRAIT, depth: 0.52, controlled: true, rest: 0.6 },
+
+  { id: "base0",  src: "layer5-bucketgrl-prt-base0.png", ...PORTRAIT },
+  { id: "base1",  src: "layer5-bucketgrl-prt-base1.png", ...PORTRAIT, controlled: true },
+
+  // Eyes: shifted looks sit below the blink frames so eyelids always cover them
+  { id: "shift_left",  src: "layer6-bucketgrl-prt-shift_left.png",  ...PORTRAIT, controlled: true },
+  { id: "shift_right", src: "layer6-bucketgrl-prt-shift_right.png", ...PORTRAIT, controlled: true },
+  { id: "shift_up",    src: "layer6-bucketgrl-prt-shift_up.png",    ...PORTRAIT, controlled: true },
+  { id: "shift_down",  src: "layer6-bucketgrl-prt-shift_down.png",  ...PORTRAIT, controlled: true },
+  { id: "blink01", src: "layer6-bucketgrl-prt-blink01.png", ...PORTRAIT, controlled: true },   // half blink
+  { id: "blink02", src: "layer6-bucketgrl-prt-blink02.png", ...PORTRAIT, controlled: true },   // closed
+
+  { id: "outline2", src: "layer7-bucketgrl-prt-outline2.png", ...PORTRAIT, depth: 0.66, controlled: true, rest: 0 }
+];
+
+// ---- Movement feel ----
+const MAX_SHIFT = 0.03;      // front-layer travel as a fraction of image width
+const TILT_RANGE = 20;       // degrees of phone tilt for full movement
+const SMOOTHING = 0.08;      // 0.04 = floaty, 0.15 = snappy
+const DIRECTION = 1;         // set to -1 if the movement feels backwards
+const BREATH_PERIOD = 4.2;   // seconds per breath
+const IDLE_PERIOD = 7;       // seconds per idle sway cycle
+
+// ---- Frame groups: each one steps through its frames on its own clock ----
+/*
+  ids              the frames in order
+  mode             "loop" = 1,2,3,1,2,3...     "pingpong" = 1,2,3,2,1,2,3...
+  frameTime        seconds each frame stays on screen (before any stops)
+  pause            seconds of rest between passes (0 = loops constantly)
+  offset           seconds before the group starts, so groups don't play together
+  hideWhenResting  true = show nothing during the pause (good for something that passes through)
+
+  stops (optional) the balloon rises, stops, then gently continues:
+    every          stop after every this-many frames
+    hold           extra seconds it stays still at each stop
+    ease           how many frames before and after each stop slow down, so it
+                   drifts to a halt and drifts off again (0 = abrupt)
+    easeStrength   how much those frames slow down (1.5 = up to 2.5x longer)
+  Set  stops: null  if you've already drawn the stops into the frames.
+*/
+const FRAME_GROUPS = [
+  { ids: ids("bird", 14), mode: "loop", frameTime: 0.10, pause: 0, offset: 0 },
+
+  { ids: ids("balloonA", 32), mode: "loop", frameTime: 0.12, pause: 5, offset: 1, hideWhenResting: true,
+    stops: { every: 10, hold: 1.2, ease: 4, easeStrength: 1.5 } },
+
+  { ids: ids("balloonB", 60), mode: "loop", frameTime: 0.10, pause: 7, offset: 6, hideWhenResting: true,
+    stops: { every: 15, hold: 1.5, ease: 4, easeStrength: 1.5 } }
+];
+
+// ---- Sparkle background (background2): twinkles, flashes on tap ----
+const SPARKLE_MIN = 0.35;    // dimmest idle sparkle (0 to 1)
+const SPARKLE_MAX = 0.90;    // brightest idle sparkle
+
+// ---- outline1: slow glow pulse; flashes on tap ----
+const OUTLINES = [
+  { id: "outline1", period: 5.0, phase: 0.0, min: 0.30, max: 0.85 }
+];
+
+// ---- outline2: invisible when idle, fades in while you tilt, flashes on tap ----
+const OUTLINE2_MAX = 0.80;     // how visible it gets at full tilt (0 to 1)
+const OUTLINE2_SMOOTH = 0.06;  // fade speed: lower = slower, softer
+
+// ---- Tap flash (sparkles + outlines) ----
+const PULSE_RISE = 0.08;     // seconds to reach full brightness
+const PULSE_DECAY = 3.2;     // higher = flash dies faster
+
+// ---- Blinking ----
+const BLINK = [[0.05, "blink01"], [0.09, "blink02"], [0.06, "blink01"]];
+const BLINK_GAP = [2.5, 6];  // random wait between blinks (min, max seconds)
+
+// ---- Eyes: follow the tilt in four directions, and glance around when you're still ----
+const SHIFT_THRESHOLD = 0.35;   // how far to tilt (0 to 1) before the eyes shift
+const SHIFT_SMOOTH = 0.25;      // 0.1 = slow fade, 0.5 = near instant
+const SWAP_HORIZONTAL = false;  // set to true if left and right look backwards
+const SWAP_VERTICAL = false;    // set to true if up and down look backwards
+const GLANCE_AFTER = 2.0;       // seconds of stillness before she starts glancing
+const GLANCE_GAP = [3, 7];      // random wait between glances
+const GLANCE_HOLD = [0.7, 1.4]; // how long each glance lasts
+
+// ---- base1: fades in while you tilt, back to base0 when idle ----
+const BASE1_TILT_GAIN = 1.6;   // how quickly it reaches full strength as you tilt
+const BASE1_IDLE_AFTER = 1.2;  // seconds of stillness before it fades back out
+const BASE1_MOVE_EPS = 0.004;  // how small a movement still counts as "still"
+const BASE1_SMOOTH = 0.05;     // fade speed: lower = slower, softer
+
+/* ======================= CODE ======================= */
+
+const stage = document.getElementById("stage");
+const enableBtn = document.getElementById("enable");
+const hint = document.getElementById("hint");
+const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const rand = ([a, b]) => a + Math.random() * (b - a);
+const TAU = Math.PI * 2;
+const EYE_DIRS = ["left", "right", "up", "down"];
+
+// Build the layers
+const layers = LAYERS.map((cfg, i) => {
+  const img = new Image();
+  img.className = "layer";
+  img.alt = "";
+  img.draggable = false;
+  img.src = cfg.src;
+  img.style.transformOrigin = cfg.origin || "50% 50%";
+  const rest = cfg.rest != null ? cfg.rest : 0;
+  const controlled = !!cfg.controlled;
+  // With this many frames, layers that aren't showing are switched off completely
+  // (not just made transparent), so the phone isn't juggling ~100 layers at once.
+  const hidden = controlled && rest <= 0.001;
+  if (controlled) img.style.opacity = rest;
+  if (hidden) img.style.display = "none";
+  stage.insertBefore(img, stage.querySelector(".ui"));
+  return {
+    id: cfg.id,
+    el: img,
+    depth: cfg.depth,
+    rotate: cfg.rotate || 0,
+    idleRotate: cfg.idleRotate || 0,
+    breathe: cfg.breathe || 0,
+    controlled: controlled,
+    rest: rest,
+    hidden: hidden,
+    phase: i * 1.7,
+    shift: 0,
+    lastOp: -1
+  };
+});
+
+// Match stage to the first layer's aspect ratio
+function setAspect() {
+  const first = layers[0].el;
+  if (first.naturalWidth) stage.style.setProperty("--ar", first.naturalWidth / first.naturalHeight);
+  sizeLayers();
+}
+layers[0].el.addEventListener("load", setAspect);
+if (layers[0].el.complete) setAspect();
+
+// Each layer is enlarged by the distance it can travel, so edges never show.
+function sizeLayers() {
+  const w = stage.clientWidth;
+  const h = stage.clientHeight;
+  layers.forEach(l => {
+    l.shift = l.depth * MAX_SHIFT * w;
+    const pad = l.shift;
+    l.el.style.left = -pad + "px";
+    l.el.style.top = -pad + "px";
+    l.el.style.width = (w + pad * 2) + "px";
+    l.el.style.height = (h + pad * 2) + "px";
+  });
+}
+new ResizeObserver(sizeLayers).observe(stage);
+
+/* ---------- Frame groups: build each group's timeline once ---------- */
+
+for (const g of FRAME_GROUPS) {
+  const n = g.ids.length;
+
+  // How long each frame stays on screen
+  const dur = new Array(n).fill(g.frameTime);
+  if (g.stops) {
+    const { every, hold, ease = 0, easeStrength = 1.5 } = g.stops;
+    for (let f = every - 1; f < n - 1; f += every) {               // f = the frame it stops on
+      for (let d = 1; d <= ease; d++) {                            // slow down into and out of the stop
+        const factor = 1 + easeStrength * (ease - d + 1) / ease;
+        if (f - d >= 0) dur[f - d] *= factor;
+        if (f + d < n) dur[f + d] *= factor;
+      }
+      dur[f] += hold;
+    }
+  }
+
+  // Order the frames play in
+  g.seq = [];
+  for (let i = 0; i < n; i++) g.seq.push(i);
+  if (g.mode === "pingpong") {
+    for (let i = n - 2; i >= 1; i--) g.seq.push(i);
+  }
+  g.durs = g.seq.map(i => dur[i]);
+  g.cycle = g.durs.reduce((s, d) => s + d, 0);                     // length of one pass
+  g.total = g.cycle + g.pause;                                     // pass plus rest
+}
+
+// Which frame is showing m seconds into a pass?
+function frameAt(g, m) {
+  let acc = 0;
+  for (let i = 0; i < g.seq.length; i++) {
+    acc += g.durs[i];
+    if (m < acc) return g.seq[i];
+  }
+  return g.seq[g.seq.length - 1];
+}
+
+/* ---------- Movement state ---------- */
+
+let tx = 0, ty = 0, cx = 0, cy = 0;
+
+/* ---------- Scene ---------- */
+
+let op = {};
+let pulseStart = -99;     // time of the last tap (seconds)
+let base1 = 0;            // current base1 amount, 0 to 1
+let outline2Amt = 0;      // current outline2 tilt amount, 0 to 1
+let lastMove = 0;         // last time the tilt or mouse moved
+let prevTx = 0, prevTy = 0;
+
+let nextBlink = 2.5, blinkStart = -1;
+let nextGlance = 4, glanceStart = -1, glanceDir = "left", glanceDur = 1;
+const eyeAmt = { left: 0, right: 0, up: 0, down: 0 };
+
+const total = steps => steps.reduce((s, st) => s + st[0], 0);
+
+function pick(u, steps) {
+  if (u < 0) return null;
+  let acc = 0;
+  for (const [dur, id] of steps) {
+    acc += dur;
+    if (u < acc) return id;
+  }
+  return null;
+}
+
+function runScene(t) {
+  op = {};
+
+  // Tap flash envelope (0 to 1)
+  const k = t - pulseStart;
+  let p = 0;
+  if (k >= 0) p = k < PULSE_RISE ? k / PULSE_RISE : Math.exp(-(k - PULSE_RISE) * PULSE_DECAY);
+
+  // Sparkle background: irregular twinkle plus tap flash
+  const wobble = 0.6 * Math.sin(t * 1.1) + 0.4 * Math.sin(t * 2.7 + 0.9);
+  const sparkle = SPARKLE_MIN + (SPARKLE_MAX - SPARKLE_MIN) * (0.5 + 0.5 * wobble);
+  op.bg2 = sparkle + (1 - sparkle) * p;
+
+  // outline1: slow eased pulse plus tap flash
+  for (const o of OUTLINES) {
+    const e = (1 - Math.cos(t * TAU / o.period + o.phase)) / 2;
+    const eased = e * e * (3 - 2 * e);
+    const v = o.min + (o.max - o.min) * eased;
+    op[o.id] = v + (1 - v) * p;
+  }
+
+  // Track whether the viewer is moving
+  const moved = Math.abs(tx - prevTx) + Math.abs(ty - prevTy);
+  prevTx = tx; prevTy = ty;
+  if (moved > BASE1_MOVE_EPS) lastMove = t;
+  const since = t - lastMove;
+
+  // base1: strength follows tilt, falls back to 0 when still
+  const target = since > BASE1_IDLE_AFTER ? 0 : clamp(Math.hypot(cx, cy) * BASE1_TILT_GAIN, 0, 1);
+  base1 += (target - base1) * BASE1_SMOOTH;
+  op.base1 = base1;
+
+  // outline2: follows the same tilt amount, but is fully invisible when idle; tap still flashes it
+  outline2Amt += (target - outline2Amt) * OUTLINE2_SMOOTH;
+  const o2 = outline2Amt * OUTLINE2_MAX;
+  op.outline2 = o2 + (1 - o2) * p;
+
+  // Frame groups (birds, balloons)
+  for (const g of FRAME_GROUPS) {
+    let frameIdx = g.hideWhenResting ? -1 : 0;
+    const u = t - g.offset;
+    if (u >= 0) {
+      const m = u % g.total;
+      if (m < g.cycle) frameIdx = frameAt(g, m);
+    }
+    for (let i = 0; i < g.ids.length; i++) op[g.ids[i]] = (i === frameIdx) ? 1 : 0;
+  }
+
+  // Random blinking
+  if (blinkStart < 0 && t >= nextBlink) blinkStart = t;
+  if (blinkStart >= 0) {
+    const u = t - blinkStart;
+    const f = pick(u, BLINK);
+    if (f) op[f] = 1;
+    if (u > total(BLINK)) {
+      blinkStart = -1;
+      nextBlink = t + rand(BLINK_GAP);
+    }
+  }
+
+  // Eyes: follow the tilt (whichever direction is strongest); glance around on their own when still
+  let want = null;
+  const ax = Math.abs(cx), ay = Math.abs(cy);
+  if (Math.max(ax, ay) > SHIFT_THRESHOLD) {
+    if (ax >= ay) {
+      want = (cx < 0) ? "left" : "right";
+      if (SWAP_HORIZONTAL) want = (want === "left") ? "right" : "left";
+    } else {
+      want = (cy < 0) ? "up" : "down";
+      if (SWAP_VERTICAL) want = (want === "up") ? "down" : "up";
+    }
+  }
+
+  if (want) {
+    glanceStart = -1;
+  } else if (since > GLANCE_AFTER) {
+    if (glanceStart < 0 && t >= nextGlance) {
+      glanceStart = t;
+      glanceDir = EYE_DIRS[Math.floor(Math.random() * EYE_DIRS.length)];
+      glanceDur = rand(GLANCE_HOLD);
+    }
+    if (glanceStart >= 0) {
+      if (t - glanceStart < glanceDur) {
+        want = glanceDir;
+      } else {
+        glanceStart = -1;
+        nextGlance = t + rand(GLANCE_GAP);
+      }
+    }
+  } else {
+    glanceStart = -1;
+  }
+  for (const d of EYE_DIRS) {
+    eyeAmt[d] += ((want === d ? 1 : 0) - eyeAmt[d]) * SHIFT_SMOOTH;
+    op["shift_" + d] = eyeAmt[d];
+  }
+}
+
+function frame(now) {
+  const t = now / 1000;
+  cx += (tx - cx) * SMOOTHING;
+  cy += (ty - cy) * SMOOTHING;
+
+  runScene(t);
+
+  for (const l of layers) {
+    if (l.controlled) {
+      const v = (l.id in op) ? op[l.id] : l.rest;
+      if (v <= 0.001) {                                  // not showing: switch it off and skip the rest
+        if (!l.hidden) { l.el.style.display = "none"; l.hidden = true; l.lastOp = 0; }
+        continue;
+      }
+      if (l.hidden) { l.el.style.display = "block"; l.hidden = false; }
+      if (v !== l.lastOp) { l.el.style.opacity = v; l.lastOp = v; }
+    }
+
+    const dx = -cx * l.shift * DIRECTION;
+    const dy = -cy * l.shift * DIRECTION;
+
+    const rot =
+      cx * l.rotate * DIRECTION +
+      Math.sin(t * TAU / IDLE_PERIOD + l.phase) * l.idleRotate;
+
+    let sx = 1, sy = 1;
+    if (l.breathe) {
+      const s = Math.sin(t * TAU / BREATH_PERIOD);
+      sy = 1 + l.breathe * s;
+      sx = 1 + l.breathe * 0.35 * s;
+    }
+
+    l.el.style.transform =
+      "translate3d(" + dx + "px," + dy + "px,0) rotate(" + rot + "deg) scale(" + sx + "," + sy + ")";
+  }
+  requestAnimationFrame(frame);
+}
+if (!reduceMotion) requestAnimationFrame(frame);
+
+/* ---------- Input: mouse, tilt, taps ---------- */
+
+stage.addEventListener("pointermove", e => {
+  if (e.pointerType === "touch" || reduceMotion) return;
+  const r = stage.getBoundingClientRect();
+  tx = clamp(((e.clientX - r.left) / r.width) * 2 - 1, -1, 1);
+  ty = clamp(((e.clientY - r.top) / r.height) * 2 - 1, -1, 1);
+});
+stage.addEventListener("pointerleave", e => {
+  if (e.pointerType !== "touch") { tx = 0; ty = 0; }
+});
+
+let base = null;
+let gotSensor = false;
+
+function onOrientation(e) {
+  if (e.gamma == null || e.beta == null || reduceMotion) return;
+  gotSensor = true;
+  if (!base) base = { g: e.gamma, b: e.beta };
+  tx = clamp((e.gamma - base.g) / TILT_RANGE, -1, 1);
+  ty = clamp((e.beta - base.b) / TILT_RANGE, -1, 1);
+}
+
+function showHint(text, ms) {
+  hint.textContent = text;
+  hint.classList.remove("hidden", "fade");
+  clearTimeout(showHint.t);
+  showHint.t = setTimeout(() => {
+    hint.classList.add("fade");
+    setTimeout(() => hint.classList.add("hidden"), 700);
+  }, ms);
+}
+
+function startTilt() {
+  window.addEventListener("deviceorientation", onOrientation);
+  enableBtn.classList.add("hidden");
+  showHint("Tilt your phone. Tap for a sparkle flash. Double-tap to re-center.", 5000);
+  setTimeout(() => {
+    if (!gotSensor) showHint("No motion sensor found. Move your mouse over the image.", 4000);
+  }, 1500);
+}
+
+// Tap = flash the sparkles and outlines. Double-tap = re-center the tilt.
+let lastTap = 0;
+stage.addEventListener("pointerdown", () => {
+  const now = performance.now();
+  if (now - lastTap < 350) {
+    base = null;
+    lastTap = 0;
+    showHint("Re-centered.", 1200);
+    return;
+  }
+  lastTap = now;
+  if (!reduceMotion) pulseStart = now / 1000;
+});
+
+const needsPermission =
+  typeof DeviceOrientationEvent !== "undefined" &&
+  typeof DeviceOrientationEvent.requestPermission === "function";
+
+const isTouch = matchMedia("(pointer: coarse)").matches;
+
+if (needsPermission) {
+  enableBtn.classList.remove("hidden");
+  enableBtn.addEventListener("click", async () => {
+    try {
+      const result = await DeviceOrientationEvent.requestPermission();
+      if (result === "granted") {
+        startTilt();
+      } else {
+        enableBtn.classList.add("hidden");
+        showHint("Motion access was denied. Reload the page to try again.", 5000);
+      }
+    } catch (err) {
+      showHint("Couldn't enable tilt on this page.", 4000);
+    }
+  });
+} else if (isTouch && "DeviceOrientationEvent" in window) {
+  startTilt();
+} else {
+  showHint("Move your mouse over the image. Click for a sparkle flash.", 4000);
+}
+</script>
+</body>
+</html>
