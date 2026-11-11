@@ -16,6 +16,8 @@
     overflow: hidden;
     touch-action: none;
     -webkit-tap-highlight-color: transparent;
+    -webkit-touch-callout: none;
+    user-select: none;
   }
   .layer {
     position: absolute;
@@ -50,7 +52,7 @@
 </head>
 <body>
 
-<main class="stage" id="stage" aria-label="Animated portrait that shifts as you tilt your phone or move your mouse. Tap for a sparkle flash.">
+<main class="stage" id="stage" aria-label="Animated portrait that shifts as you tilt your phone or move your mouse. Tap for music and a sparkle flash. Hold to reverse the balloons.">
   <div class="ui">
     <button id="enable" class="hidden" type="button">Tap to enable tilt</button>
     <div id="hint" class="hint hidden"></div>
@@ -75,27 +77,16 @@
 */
 const PORTRAIT = { depth: 0.60, breathe: 0.006, origin: "50% 90%" };
 
-// Helpers that expand a numbered series (bird01, bird02, ...) into layer entries and ids
-const ids = (prefix, count) =>
-  Array.from({ length: count }, (_, i) => prefix + String(i + 1).padStart(2, "0"));
-
-function frames(idPrefix, srcPrefix, count, extra) {
-  return ids(idPrefix, count).map((id, i) => ({
-    id: id,
-    src: srcPrefix + String(i + 1).padStart(2, "0") + ".png",
-    controlled: true,
-    rest: (i === 0 && extra.rest1) ? extra.rest1 : 0,
-    depth: extra.depth
-  }));
-}
-
 const LAYERS = [
   { id: "bg1", src: "layer1-bucketgrl-prt-background1.png", depth: 0.12 },
   { id: "bg2", src: "layer1-bucketgrl-prt-background2.png", depth: 0.18, controlled: true, rest: 0.7 },   // sparkles and clouds
 
-  ...frames("bird",     "layer2-bucketgrl-prt-bird",     14, { depth: 0.28, rest1: 1 }),
-  ...frames("balloonA", "layer3-bucketgrl-prt-balloonA", 32, { depth: 0.32 }),
-  ...frames("balloonB", "layer3-bucketgrl-prt-balloonB", 60, { depth: 0.38 }),
+  // Birds: one image that the script spins around BIRD_ORIGIN (see BIRDS below)
+  { id: "bird", src: "layer2-bucketgrl-prt-bird01.png", depth: 0.28, origin: "50% 50%", bird: true },
+
+  // Balloons: one image each; the script drifts them up (or down) the frame (see BALLOONS below)
+  { id: "balloonA", src: "layer3-bucketgrl-prt-balloonA01.png", depth: 0.32, balloon: true },
+  { id: "balloonB", src: "layer3-bucketgrl-prt-balloonB01.png", depth: 0.38, balloon: true },
 
   { id: "outline1", src: "layer4-bucketgrl-prt-outline1.png", ...PORTRAIT, depth: 0.52, controlled: true, rest: 0.6 },
 
@@ -121,32 +112,37 @@ const DIRECTION = 1;         // set to -1 if the movement feels backwards
 const BREATH_PERIOD = 4.2;   // seconds per breath
 const IDLE_PERIOD = 7;       // seconds per idle sway cycle
 
-// ---- Frame groups: each one steps through its frames on its own clock ----
-/*
-  ids              the frames in order
-  mode             "loop" = 1,2,3,1,2,3...     "pingpong" = 1,2,3,2,1,2,3...
-  frameTime        seconds each frame stays on screen (before any stops)
-  pause            seconds of rest between passes (0 = loops constantly)
-  offset           seconds before the group starts, so groups don't play together
-  hideWhenResting  true = show nothing during the pause (good for something that passes through)
+// ---- Birds: one image spun in a complete circle ----
+const BIRD_ORIGIN = "50% 50%";  // the centre they circle around, as "x% y%" of the whole canvas (EDIT THIS to the middle of the ring)
+const BIRD_PERIOD = 24;         // seconds for one full circle
+const BIRD_DIR = 1;             // 1 = clockwise, -1 = anticlockwise
 
-  stops (optional) the balloon rises, stops, then gently continues:
-    every          stop after every this-many frames
-    hold           extra seconds it stays still at each stop
-    ease           how many frames before and after each stop slow down, so it
-                   drifts to a halt and drifts off again (0 = abrupt)
-    easeStrength   how much those frames slow down (1.5 = up to 2.5x longer)
-  Set  stops: null  if you've already drawn the stops into the frames.
-*/
-const FRAME_GROUPS = [
-  { ids: ids("bird", 14), mode: "loop", frameTime: 0.10, pause: 0, offset: 0 },
-
-  { ids: ids("balloonA", 32), mode: "loop", frameTime: 0.12, pause: 5, offset: 1, hideWhenResting: true,
-    stops: { every: 10, hold: 1.2, ease: 4, easeStrength: 1.5 } },
-
-  { ids: ids("balloonB", 60), mode: "loop", frameTime: 0.10, pause: 7, offset: 6, hideWhenResting: true,
-    stops: { every: 15, hold: 1.5, ease: 4, easeStrength: 1.5 } }
+// ---- Balloons: drift from the bottom to the top of the frame, then loop ----
+//   travel      seconds to cross the whole frame (bigger = slower)
+//   hoverGap    random wait (min, max seconds) between hovers
+//   hoverTime   random length (min, max seconds) of each hover
+//   startAt     where it begins on its first pass (0 = bottom, 1 = top), so the two balloons aren't in step
+//   sway / swayPeriod   gentle side-to-side drift (fraction of image width) and its speed
+//   swayTilt    degrees of rock that goes with the sway
+const BALLOONS = [
+  { id: "balloonA", travel: 16, hoverGap: [5, 11], hoverTime: [1.6, 3.6], startAt: 0.15, sway: 0.010, swayPeriod: 5.2, swayTilt: 2.5 },
+  { id: "balloonB", travel: 21, hoverGap: [6, 13], hoverTime: [1.8, 4.0], startAt: 0.60, sway: 0.014, swayPeriod: 6.4, swayTilt: 3.0 }
 ];
+const BALLOON_EASE = 2.2;         // how softly a balloon slows into / out of a hover (higher = quicker)
+const BALLOON_MARGIN = 0.04;      // extra distance past the edges so a balloon is fully out of sight before it loops
+const BALLOON_TILT_SLOW = 0;      // 0 = tilting doesn't affect them; 0.5 = they slow to half speed at full tilt
+const REVERSE_EASE = 3;           // how smoothly a balloon turns around when you long-press (higher = quicker)
+const LONG_PRESS_TIME = 0.5;      // seconds to hold before it counts as a long press
+const LONG_PRESS_MODE = "toggle"; // "toggle" = each long press flips the direction (up <-> down); "hold" = balloons fall only while you hold
+
+// ---- Music: first tap plays, second tap pauses, double-tap resets ----
+const AUDIO = { src: "Hej Motti - Umino.mp3", start: 0, length: 45, fade: 1.2, fadeIn: 0.8 };   // plays 45 seconds, then loops
+const AUDIO_LOOP = true;            // true = the 45 seconds repeat until you pause
+const AUDIO_VOLUME = 1;             // 0 to 1
+const DOUBLE_TAP_RESTARTS = false;  // false = double-tap rewinds and stays paused; true = rewinds and plays again
+const DOUBLE_TAP_RECENTERS = true;  // double-tap also re-centers the tilt (the old behaviour)
+const TAP_MAX_MOVE = 14;            // pixels a finger/mouse may move and still count as a tap
+const DOUBLE_TAP_TIME = 0.35;       // seconds between two taps to count as a double-tap
 
 // ---- Sparkle background (background2): twinkles, flashes on tap ----
 const SPARKLE_MIN = 0.35;    // dimmest idle sparkle (0 to 1)
@@ -211,6 +207,8 @@ const layers = LAYERS.map((cfg, i) => {
   const hidden = controlled && rest <= 0.001;
   if (controlled) img.style.opacity = rest;
   if (hidden) img.style.display = "none";
+  if (cfg.balloon) img.style.display = "none";            // shown once its size has been measured
+  if (cfg.bird) img.style.transformOrigin = BIRD_ORIGIN;
   stage.insertBefore(img, stage.querySelector(".ui"));
   return {
     id: cfg.id,
@@ -219,6 +217,8 @@ const layers = LAYERS.map((cfg, i) => {
     rotate: cfg.rotate || 0,
     idleRotate: cfg.idleRotate || 0,
     breathe: cfg.breathe || 0,
+    bird: !!cfg.bird,
+    balloon: !!cfg.balloon,
     controlled: controlled,
     rest: rest,
     hidden: hidden,
@@ -252,44 +252,79 @@ function sizeLayers() {
 }
 new ResizeObserver(sizeLayers).observe(stage);
 
-/* ---------- Frame groups: build each group's timeline once ---------- */
+/* ---------- Balloons: measure each one, then drift it up the frame ---------- */
 
-for (const g of FRAME_GROUPS) {
-  const n = g.ids.length;
-
-  // How long each frame stays on screen
-  const dur = new Array(n).fill(g.frameTime);
-  if (g.stops) {
-    const { every, hold, ease = 0, easeStrength = 1.5 } = g.stops;
-    for (let f = every - 1; f < n - 1; f += every) {               // f = the frame it stops on
-      for (let d = 1; d <= ease; d++) {                            // slow down into and out of the stop
-        const factor = 1 + easeStrength * (ease - d + 1) / ease;
-        if (f - d >= 0) dur[f - d] *= factor;
-        if (f + d < n) dur[f + d] *= factor;
-      }
-      dur[f] += hold;
+// Downscale an image and find the box around its visible pixels
+function scanBox(img) {
+  const w = 300, h = Math.max(1, Math.round(w * img.naturalHeight / img.naturalWidth));
+  const c = document.createElement("canvas");
+  c.width = w; c.height = h;
+  const ctx = c.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(img, 0, 0, w, h);
+  const d = ctx.getImageData(0, 0, w, h).data;
+  let x0 = w, x1 = -1, y0 = h, y1 = -1;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    if (d[(y * w + x) * 4 + 3] > 20) {
+      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
     }
   }
-
-  // Order the frames play in
-  g.seq = [];
-  for (let i = 0; i < n; i++) g.seq.push(i);
-  if (g.mode === "pingpong") {
-    for (let i = n - 2; i >= 1; i--) g.seq.push(i);
-  }
-  g.durs = g.seq.map(i => dur[i]);
-  g.cycle = g.durs.reduce((s, d) => s + d, 0);                     // length of one pass
-  g.total = g.cycle + g.pause;                                     // pass plus rest
+  return x1 < 0 ? null : { x0: x0 / w, x1: (x1 + 1) / w, y0: y0 / h, y1: (y1 + 1) / h };
 }
 
-// Which frame is showing m seconds into a pass?
-function frameAt(g, m) {
-  let acc = 0;
-  for (let i = 0; i < g.seq.length; i++) {
-    acc += g.durs[i];
-    if (m < acc) return g.seq[i];
+const balloons = BALLOONS.map((cfg, i) => {
+  const layer = layers.find(l => l.id === cfg.id);
+  if (!layer) return null;
+  const b = {
+    ...cfg, l: layer, ready: false,
+    y0: 0, y1: 1, cy: 0.5,              // box around the balloon, as fractions of the image height (measured below)
+    p: cfg.startAt, speed: 1, hover: false, hoverUntil: 0,
+    nextHover: 3 + Math.random() * 4, phase: i * 2.3
+  };
+  const setup = () => {
+    let box = null;
+    try { box = scanBox(layer.el); }
+    catch (e) { console.info("Couldn't measure " + cfg.id + " (normal when opened from disk); using the full frame height."); }
+    if (box) {
+      b.y0 = box.y0; b.y1 = box.y1;
+      layer.el.style.transformOrigin = (((box.x0 + box.x1) / 2) * 100) + "% " + (((box.y0 + box.y1) / 2) * 100) + "%";
+    }
+    b.cy = (b.y0 + b.y1) / 2;
+    b.ready = true;
+    layer.el.style.display = "block";
+  };
+  if (layer.el.complete && layer.el.naturalWidth) setup(); else layer.el.addEventListener("load", setup, { once: true });
+  return b;
+}).filter(Boolean);
+
+let dirTarget = 1;      // 1 = balloons drift up, -1 = drift down
+let dirNow = 1;         // eases toward dirTarget so they turn around smoothly
+
+// Vertical position (in image heights) of a balloon at progress p: p = 0 just below the frame, p = 1 just above it
+function balloonOffset(b) {
+  const start = 1 - b.y0 + BALLOON_MARGIN;
+  const travel = (1 - b.y0) + b.y1 + 2 * BALLOON_MARGIN;
+  return start - b.p * travel;
+}
+
+function updateBalloons(t, dt) {
+  dirNow += (dirTarget - dirNow) * (1 - Math.exp(-dt * REVERSE_EASE));
+  const tiltSlow = 1 - BALLOON_TILT_SLOW * clamp(Math.hypot(cx, cy), 0, 1);
+  for (const b of balloons) {
+    if (!b.ready) continue;
+
+    // at random moments a visible balloon stops and hovers, then drifts on
+    if (!b.hover && t >= b.nextHover) {
+      const y = b.cy + balloonOffset(b);            // balloon centre, 0 = top of frame, 1 = bottom
+      if (y > 0.15 && y < 0.85) { b.hover = true; b.hoverUntil = t + rand(b.hoverTime); }
+      else b.nextHover = t + 0.4;
+    }
+    if (b.hover && t >= b.hoverUntil) { b.hover = false; b.nextHover = t + rand(b.hoverGap); }
+
+    b.speed += ((b.hover ? 0 : 1) - b.speed) * (1 - Math.exp(-dt * BALLOON_EASE));
+    b.p += dirNow * b.speed * tiltSlow * dt / b.travel;
+    if (b.p > 1) b.p -= 1;                          // out of the top: back in at the bottom
+    else if (b.p < 0) b.p += 1;                     // out of the bottom (reversed): back in at the top
   }
-  return g.seq[g.seq.length - 1];
 }
 
 /* ---------- Movement state ---------- */
@@ -358,17 +393,6 @@ function runScene(t) {
   const o2 = outline2Amt * OUTLINE2_MAX;
   op.outline2 = o2 + (1 - o2) * p;
 
-  // Frame groups (birds, balloons)
-  for (const g of FRAME_GROUPS) {
-    let frameIdx = g.hideWhenResting ? -1 : 0;
-    const u = t - g.offset;
-    if (u >= 0) {
-      const m = u % g.total;
-      if (m < g.cycle) frameIdx = frameAt(g, m);
-    }
-    for (let i = 0; i < g.ids.length; i++) op[g.ids[i]] = (i === frameIdx) ? 1 : 0;
-  }
-
   // Random blinking
   if (blinkStart < 0 && t >= nextBlink) blinkStart = t;
   if (blinkStart >= 0) {
@@ -419,12 +443,18 @@ function runScene(t) {
   }
 }
 
+let lastT = null;
+
 function frame(now) {
   const t = now / 1000;
+  const dt = lastT == null ? 0 : Math.min(t - lastT, 0.05);
+  lastT = t;
+  const W = stage.clientWidth, H = stage.clientHeight;
   cx += (tx - cx) * SMOOTHING;
   cy += (ty - cy) * SMOOTHING;
 
   runScene(t);
+  updateBalloons(t, dt);
 
   for (const l of layers) {
     if (l.controlled) {
@@ -437,12 +467,28 @@ function frame(now) {
       if (v !== l.lastOp) { l.el.style.opacity = v; l.lastOp = v; }
     }
 
-    const dx = -cx * l.shift * DIRECTION;
-    const dy = -cy * l.shift * DIRECTION;
+    let dx = -cx * l.shift * DIRECTION;
+    let dy = -cy * l.shift * DIRECTION;
 
-    const rot =
+    let rot =
       cx * l.rotate * DIRECTION +
       Math.sin(t * TAU / IDLE_PERIOD + l.phase) * l.idleRotate;
+
+    // birds: one image spun around BIRD_ORIGIN, a full circle every BIRD_PERIOD seconds
+    if (l.bird) rot += ((t / BIRD_PERIOD) % 1) * 360 * BIRD_DIR;
+
+    // balloons: drift up (or down) the frame, hover now and then, sway gently
+    if (l.balloon) {
+      const b = balloons.find(x => x.l === l);
+      if (!b || !b.ready) continue;
+      const layerH = H + 2 * l.shift;
+      const hoverAmt = 1 - b.speed;                                   // 1 while fully hovering
+      const bob = hoverAmt * Math.sin(t * TAU / 2.6 + b.phase) * 0.006 * layerH;
+      dy += balloonOffset(b) * layerH + bob;
+      const sw = Math.sin(t * TAU / b.swayPeriod + b.phase);
+      dx += sw * b.sway * W;
+      rot += sw * b.swayTilt;
+    }
 
     let sx = 1, sy = 1;
     if (l.breathe) {
@@ -494,24 +540,140 @@ function showHint(text, ms) {
 function startTilt() {
   window.addEventListener("deviceorientation", onOrientation);
   enableBtn.classList.add("hidden");
-  showHint("Tilt your phone. Tap for a sparkle flash. Double-tap to re-center.", 5000);
+  showHint("Tilt your phone. Tap for music, double-tap to reset it. Hold to reverse the balloons.", 6000);
   setTimeout(() => {
     if (!gotSensor) showHint("No motion sensor found. Move your mouse over the image.", 4000);
   }, 1500);
 }
 
-// Tap = flash the sparkles and outlines. Double-tap = re-center the tilt.
-let lastTap = 0;
-stage.addEventListener("pointerdown", () => {
-  const now = performance.now();
-  if (now - lastTap < 350) {
-    base = null;
-    lastTap = 0;
-    showHint("Re-centered.", 1200);
+/* ---------- Music ---------- */
+
+const audio = new Audio();
+audio.preload = "metadata";
+audio.volume = AUDIO_VOLUME;
+audio.src = encodeURI(AUDIO.src);
+const clipStart = AUDIO.start || 0;
+const clipEnd = AUDIO.length > 0 ? clipStart + AUDIO.length : Infinity;
+let audioFailed = false;
+
+audio.addEventListener("error", () => {
+  audioFailed = true;
+  showHint("Couldn't load \"" + AUDIO.src + "\". Check the file is in the same folder as this page and the name matches.", 6000);
+});
+audio.addEventListener("loadedmetadata", () => rewind());      // jump to the clip's start once the file is ready
+
+function rewind() {
+  try { audio.currentTime = clipStart; } catch (e) {}
+  audio.volume = AUDIO.fadeIn > 0 ? 0 : AUDIO_VOLUME;           // fades up from silence (not possible on iPhones)
+}
+
+// The clip ends at start + length even though the file is longer: fade out, loop (or stop), fade back in
+setInterval(() => {
+  if (audio.paused) return;
+  const t = audio.currentTime;
+  if (t >= clipEnd) {
+    if (AUDIO_LOOP) rewind();
+    else { audio.pause(); rewind(); showHint("\u21BA Done. Tap to play again", 1500); }
+    return;
+  }
+  let v = 1;
+  if (AUDIO.fadeIn > 0) v = Math.min(v, Math.max(0, (t - clipStart) / AUDIO.fadeIn));
+  if (AUDIO.fade > 0) v = Math.min(v, Math.max(0, (clipEnd - t) / AUDIO.fade));
+  audio.volume = clamp(AUDIO_VOLUME * v, 0, 1);
+}, 50);
+
+audio.addEventListener("ended", () => {                        // only reached if the file is shorter than the clip
+  rewind();
+  if (AUDIO_LOOP) audio.play().catch(() => {});
+});
+
+function togglePlay() {
+  if (audio.paused) {
+    if (audio.currentTime < clipStart || audio.currentTime >= clipEnd) rewind();   // always begin inside the clip
+    const p = audio.play();
+    if (p && p.catch) p.catch(() => { if (!audioFailed) showHint("Couldn't play the music on this device.", 3500); });
+    showHint("\u25B6 Playing", 900);
+  } else {
+    audio.pause();
+    showHint("\u23F8 Paused", 900);
+  }
+}
+
+function resetAudio() {
+  audio.pause();
+  rewind();
+  if (DOUBLE_TAP_RESTARTS) {
+    const p = audio.play();
+    if (p && p.catch) p.catch(() => {});
+    showHint("\u21BA Restarted", 1000);
+  } else {
+    showHint("\u21BA Reset", 1000);
+  }
+}
+
+/* ---------- Taps and long press ---------- */
+// Tap = play / pause (and a sparkle flash). Double-tap = reset the music. Long press = reverse the balloons.
+// A tap is detected on release because phones only allow audio to start from a release (not a press).
+
+let down = null;            // the press in progress
+let pressTimer = null;
+let longFired = false;
+let lastTap = -99;
+
+function setBalloonDirection(dir) {
+  dirTarget = dir;
+  showHint(dir > 0 ? "Balloons drifting up" : "Balloons drifting down", 1200);
+}
+
+stage.addEventListener("contextmenu", e => e.preventDefault());   // no long-press menu on phones
+
+stage.addEventListener("pointerdown", e => {
+  if (e.target.closest && e.target.closest(".ui button")) { down = null; return; }
+  down = { x: e.clientX, y: e.clientY, id: e.pointerId };
+  longFired = false;
+  clearTimeout(pressTimer);
+  pressTimer = setTimeout(() => {
+    if (!down) return;
+    longFired = true;
+    if (LONG_PRESS_MODE === "hold") setBalloonDirection(-1);
+    else setBalloonDirection(-dirTarget);
+    if (navigator.vibrate) navigator.vibrate(20);
+  }, LONG_PRESS_TIME * 1000);
+});
+
+stage.addEventListener("pointermove", e => {                        // moving far enough turns the press into a drag, not a tap
+  if (down && down.id === e.pointerId && Math.hypot(e.clientX - down.x, e.clientY - down.y) > TAP_MAX_MOVE) {
+    down.dragged = true;
+    clearTimeout(pressTimer);
+  }
+});
+
+stage.addEventListener("pointercancel", () => { down = null; clearTimeout(pressTimer); });
+
+stage.addEventListener("pointerup", e => {
+  clearTimeout(pressTimer);
+  if (!down || down.id !== e.pointerId) return;
+  const wasDragged = !!down.dragged;
+  down = null;
+
+  if (longFired) {                                                   // a long press is not also a tap
+    longFired = false;
+    if (LONG_PRESS_MODE === "hold") setBalloonDirection(1);
+    return;
+  }
+  if (wasDragged) return;
+
+  const now = performance.now() / 1000;
+  if (now - lastTap < DOUBLE_TAP_TIME) {
+    // double-tap: reset the music (the first tap of the pair already toggled it; this undoes that)
+    lastTap = -99;
+    resetAudio();
+    if (DOUBLE_TAP_RECENTERS) base = null;
     return;
   }
   lastTap = now;
-  if (!reduceMotion) pulseStart = now / 1000;
+  togglePlay();
+  if (!reduceMotion) pulseStart = now;                               // sparkle flash on each tap
 });
 
 const needsPermission =
@@ -538,7 +700,7 @@ if (needsPermission) {
 } else if (isTouch && "DeviceOrientationEvent" in window) {
   startTilt();
 } else {
-  showHint("Move your mouse over the image. Click for a sparkle flash.", 4000);
+  showHint("Move your mouse over the image. Click for music, double-click to reset. Hold to reverse the balloons.", 5000);
 }
 </script>
 </body>
